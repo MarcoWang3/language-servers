@@ -96,9 +96,87 @@ export class FsWrite {
         }
     }
 
-    public async invoke(params: FsWriteParams): Promise<InvokeOutput> {
+    public async invoke(params: FsWriteParams, stream?: WritableStream): Promise<InvokeOutput> {
         const sanitizedPath = sanitize(params.path)
 
+        // Get original content for diff calculation
+        let originalContent = ''
+        try {
+            originalContent = await this.workspace.fs.readFile(sanitizedPath)
+        } catch {
+            // File doesn't exist yet, original content is empty
+            originalContent = ''
+        }
+
+        // If stream is provided, send incremental updates
+        if (stream) {
+            const writer = stream.getWriter()
+
+            // Send initial signal with original content
+            await writer.write({
+                type: 'fsWriteStart',
+                path: sanitizedPath,
+                originalContent,
+                explanation: params.explanation,
+            })
+
+            // Get the content to write
+            let content = ''
+            switch (params.command) {
+                case 'create':
+                    content = params.fileText
+                    break
+                case 'strReplace':
+                    content = getStrReplaceContent(params, originalContent)
+                    break
+                case 'insert':
+                    content = getInsertContent(params, originalContent)
+                    break
+                case 'append':
+                    content = getAppendContent(params, originalContent)
+                    break
+            }
+
+            // Split content into chunks for incremental updates
+            const lines = content.split('\n')
+            let accumulatedContent = ''
+            const chunkSize = Math.max(1, Math.floor(lines.length / 10)) // 10 updates max
+
+            for (let i = 0; i < lines.length; i += chunkSize) {
+                const chunk = lines.slice(i, Math.min(i + chunkSize, lines.length))
+                accumulatedContent += chunk.join('\n')
+
+                // Add newline if not the last chunk
+                if (i + chunkSize < lines.length) {
+                    accumulatedContent += '\n'
+                }
+
+                // Send progress update with accumulated content
+                await writer.write({
+                    type: 'fsWriteProgress',
+                    path: sanitizedPath,
+                    content: accumulatedContent,
+                    progress: Math.min(1, (i + chunkSize) / lines.length),
+                    originalContent, // Include for diff calculation
+                })
+
+                // Small delay to create animation effect (only in non-production)
+                if (process.env.NODE_ENV !== 'production') {
+                    await new Promise(resolve => setTimeout(resolve, 100))
+                }
+            }
+
+            // Send completion signal
+            await writer.write({
+                type: 'fsWriteComplete',
+                path: sanitizedPath,
+                finalContent: content,
+            })
+
+            await writer.close()
+        }
+
+        // 执行实际的文件写入操作
         switch (params.command) {
             case 'create':
                 await this.handleCreate(params, sanitizedPath)
