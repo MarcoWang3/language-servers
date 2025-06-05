@@ -155,6 +155,8 @@ export class AgenticChatController implements ChatHandlers {
     #userWrittenCodeTracker: UserWrittenCodeTracker | undefined
     #toolUseStartTimes: Record<string, number> = {}
     #toolUseLatencies: Array<{ toolName: string; toolUseId: string; latency: number }> = []
+    #currentTabId: string = ''
+    #originalContentMap: Map<string, string> = new Map()
 
     /**
      * Determines the appropriate message ID for a tool use based on tool type and name
@@ -377,6 +379,7 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     async onChatPrompt(params: ChatParams, token: CancellationToken): Promise<ChatResult | ResponseError<ChatResult>> {
+        this.#currentTabId = params.tabId
         // Phase 1: Initial Setup - This happens only once
         const maybeDefaultResponse = getDefaultChatResponse(params.prompt.prompt)
         if (maybeDefaultResponse) {
@@ -928,7 +931,15 @@ export class AgenticChatController implements ChatHandlers {
                     case 'listDirectory':
                     case 'grepSearch':
                     case 'fuzzySearch':
-                    case 'fsWrite':
+                    case 'fsWrite': {
+                        const tool = new FsWrite(this.#features)
+                        // Get the writable stream for incremental updates
+                        const fsWriteParams = toolUse.input as unknown as FsWriteParams
+                        const ws = this.#getWritableStream(chatResultStream, toolUse)
+
+                        // Run the tool with the stream - 添加 stream 参数
+                        const result = await tool.invoke(fsWriteParams, ws)
+                    }
                     case 'executeBash': {
                         const toolMap = {
                             fsRead: { Tool: FsRead },
@@ -1340,6 +1351,58 @@ export class AgenticChatController implements ChatHandlers {
     }
 
     #getWritableStream(chatResultStream: AgenticChatResultStream, toolUse: ToolUse): WritableStream | undefined {
+        if (toolUse.name === 'fsWrite') {
+            const toolMsgId = toolUse.toolUseId!
+
+            return new WritableStream({
+                write: async (chunk: any) => {
+                    if (chunk.type === 'fsWriteStart') {
+                        // Store original content in the session for later use
+                        this.#originalContentMap.set(toolMsgId, chunk.originalContent)
+                        return
+                    } else if (chunk.type === 'fsWriteProgress') {
+                        // Update the existing progress card with current progress
+                        const input = toolUse.input as unknown as FsWriteParams
+                        const fileName = path.basename(input.path)
+                        const progressMessageId = progressPrefix + toolMsgId
+
+                        // Get the existing block ID to overwrite it
+                        const blockId = chatResultStream.getMessageBlockId(progressMessageId)
+                        if (blockId !== undefined) {
+                            await chatResultStream.overwriteResultBlock(
+                                {
+                                    type: 'tool',
+                                    messageId: progressMessageId,
+                                    header: {
+                                        fileList: {
+                                            filePaths: [fileName],
+                                            details: {
+                                                [fileName]: {
+                                                    description: input.path, // Full path as description
+                                                },
+                                            },
+                                        },
+                                        status: {
+                                            status: 'info',
+                                            icon: 'progress',
+                                            text: `Writing... ${Math.round(chunk.progress * 100)}%`,
+                                        },
+                                    },
+                                },
+                                blockId
+                            )
+                        }
+                    }
+                    // No need to handle fsWriteComplete - final card will be created by regular flow
+                },
+
+                close: async () => {
+                    // Stream closed, file write is complete
+                    this.#originalContentMap.delete(toolMsgId)
+                },
+            })
+        }
+
         if (toolUse.name !== 'executeBash') {
             return
         }
